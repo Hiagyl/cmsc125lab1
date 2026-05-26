@@ -68,4 +68,7 @@ void builtin_exit(ShellContext *ctx);
 
 void add_to_history(ShellContext *ctx, const char *line);
 void builtin_history(ShellContext *ctx);
+
+/* --- 7. Async Background Jobs --- */
+void setup_signal_handlers();
 #endif

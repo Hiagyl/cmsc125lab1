@@ -8,6 +8,59 @@
 #include <errno.h>
 #include "shell.h"
 
+static ShellContext *global_ctx = NULL;
+
+void sigchld_handler() {
+    if (!global_ctx) return;
+    
+    int saved_errno = errno; // Preserve errno to keep the handler safe
+    int status;
+    
+    // Asynchronously reap any background job that finished immediately
+    for (int i = 0; i < global_ctx->job_count; i++) {
+        // WNOHANG ensures we don't block if a job is still actively running
+        pid_t pid = waitpid(global_ctx->jobs[i].pid, &status, WNOHANG);
+        if (pid > 0) {
+            printf("\n[%d] Finished background job: %s (PID: %d)\nmysh> ", 
+                   global_ctx->jobs[i].job_id, 
+                   global_ctx->jobs[i].command_name, 
+                   global_ctx->jobs[i].pid);
+            fflush(stdout);
+
+            // Shift array down to maintain order
+            for (int j = i; j < global_ctx->job_count - 1; j++) {
+                global_ctx->jobs[j] = global_ctx->jobs[j + 1];
+            }
+            global_ctx->job_count--;
+            i--; // Adjust index since we shifted the array
+        }
+    }
+    errno = saved_errno;
+}
+
+void setup_signal_handlers() {
+    struct sigaction sa_chld, sa_int, sa_trm;
+
+    // Configure SIGCHLD handler to reap background processes instantly
+    sa_chld.sa_handler = sigchld_handler;
+    sigemptyset(&sa_chld.sa_mask);
+    sa_chld.sa_flags = SA_RESTART | SA_NOCLDSTOP; 
+    sigaction(SIGCHLD, &sa_chld, NULL);
+
+    // Configure SIGINT (Ctrl+C) to be IGNORED by the parent shell wrapper
+    sa_int.sa_handler = SIG_IGN; 
+    sigemptyset(&sa_int.sa_mask);
+    sa_int.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa_int, NULL);
+
+    // Ignore SIGTTOU and SIGTTIN so tcsetpgrp() doesn't stop the shell
+    sa_trm.sa_handler = SIG_IGN;
+    sigemptyset(&sa_trm.sa_mask);
+    sa_trm.sa_flags = SA_RESTART;
+    sigaction(SIGTTOU, &sa_trm, NULL);
+    sigaction(SIGTTIN, &sa_trm, NULL);
+}
+
 int command_exists(char *cmd) {
     if (strchr(cmd, '/') != NULL) {
         return access(cmd, X_OK) == 0;
@@ -52,8 +105,7 @@ void apply_redirection(Command *cmd) {
 void executor(ShellContext *ctx, Command *cmd) {
     if (cmd->argv[0] == NULL) return;
 
-    reap_background_jobs(ctx);
-
+    global_ctx = ctx;
     if (handle_builtins(ctx, cmd)) return;
 
     if (!command_exists(cmd->argv[0])) {
@@ -63,6 +115,15 @@ void executor(ShellContext *ctx, Command *cmd) {
     
     pid_t pid = fork();
     if (pid == 0) {
+
+        setpgid(0, 0);
+        // This ensures Ctrl+C actually kills the foreground application
+        struct sigaction sa;
+        sa.sa_handler = SIG_DFL;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGINT, &sa, NULL);
+
         apply_redirection(cmd);
         if (execvp(cmd->argv[0], cmd->argv) == -1) {
             if (errno == ENOENT) {
@@ -72,12 +133,14 @@ void executor(ShellContext *ctx, Command *cmd) {
             } else {
                 perror("mysh");
             }
-            /* Standard exit code for command not found is 127 */
             exit(127);
         }
         exit(EXIT_FAILURE);
     } 
     else if (pid > 0) {
+
+        setpgid(pid, pid);
+
         if (cmd->background) {
             if (ctx->job_count < MAX_BG_JOBS) {
                 BackgroundJob *j = &ctx->jobs[ctx->job_count];
@@ -89,7 +152,9 @@ void executor(ShellContext *ctx, Command *cmd) {
                 ctx->job_count++;
             }
         } else {
+            tcsetpgrp(STDIN_FILENO, pid);
             waitpid(pid, NULL, 0);
+            tcsetpgrp(STDIN_FILENO, getpgrp());
         }
     } else {
         perror("fork");

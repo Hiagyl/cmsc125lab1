@@ -60,10 +60,12 @@ int main() {
     ShellContext *ctx = context_create();
     if (!ctx) return 1;
 
+    setup_signal_handlers();
+
     char line[1024];
 
     while (ctx->is_running) {
-        reap_background_jobs(ctx);
+        // reap_background_jobs(ctx);
         printf("mysh> ");
         fflush(stdout);
 
